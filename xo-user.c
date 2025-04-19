@@ -14,6 +14,29 @@
 #define XO_DEVICE_FILE "/dev/kxo"
 #define XO_DEVICE_ATTR_FILE "/sys/class/kxo/kxo/kxo_state"
 
+#define READBUFFER_SIZE 8
+
+void draw_board_user(unsigned char *bitmap)
+{
+    for (int i = 0; i < 16; ++i) {
+        int byte_index = (i * 2) / 8;
+        int bit_offset = (i * 2) % 8;
+        u_int8_t val = (bitmap[byte_index] >> bit_offset) & 0x3;
+
+        char c = ' ';
+        if (val == 1)
+            c = 'O';
+        else if (val == 2)
+            c = 'X';
+
+        printf("%c", c);
+        if (i % 4 != 3)
+            printf("|");
+        else
+            printf("\n");
+    }
+}
+
 static bool status_check(void)
 {
     FILE *fp = fopen(XO_STATUS_FILE, "r");
@@ -91,7 +114,7 @@ int main(int argc, char *argv[])
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-    char display_buf[DRAWBUFFER_SIZE];
+    char display_buf[READBUFFER_SIZE];
 
     fd_set readset;
     int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
@@ -115,9 +138,20 @@ int main(int argc, char *argv[])
             listen_keyboard_handler();
         } else if (read_attr && FD_ISSET(device_fd, &readset)) {
             FD_CLR(device_fd, &readset);
-            printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
-            read(device_fd, display_buf, DRAWBUFFER_SIZE);
-            printf("%s", display_buf);
+            printf("\033[H\033[J");  // ASCII escape code to clear the screen
+            // read(device_fd, display_buf, READBUFFER_SIZE); printf("%s",
+            // display_buf);
+            ssize_t n = read(device_fd, display_buf, sizeof(display_buf));
+            // // printf("Read display_buf  fer size: %zd\n", n);
+            // if (n < 4) {
+            //     usleep(1000);  // 避免 busy looping
+            //     continue;
+            // }
+            unsigned char *bitmap = display_buf;
+
+            u_int32_t exec_time_ms = *(u_int32_t *) (display_buf + 4);
+            printf("AI move took %u ms\n", exec_time_ms);
+            draw_board_user(display_buf);
         }
     }
 

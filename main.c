@@ -12,9 +12,9 @@
 #include <linux/workqueue.h>
 
 #include "game.h"
+#include "kxo_coroutine.h"
 #include "mcts.h"
 #include "negamax.h"
-
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("In-kernel Tic-Tac-Toe game engine");
@@ -41,7 +41,30 @@ struct kxo_attr {
     rwlock_t lock;
 };
 
+#define couroutine_max_time_ms 2000
+
 static struct kxo_attr attr_obj;
+
+static struct kxo_coroutine ai1_coro, ai2_coro;
+
+static u32 coroutine_exec_time_ms;
+
+static u32 load_avg_fixed = 0;  // 用 Q8.8 固定點數表示 load (256 = 1.0)
+#define LOAD_ALPHA 245          // e^(-1/60) ≈ 0.96，Q8.8 = 245
+
+static void update_load_avg(u32 step_time_ms)
+{
+    const u32 interval = delay;                        // 100ms tick
+    u32 current_load = step_time_ms * 256 / interval;  // Q8.8 格式
+
+    // load_avg = load_avg * α + current * (1 - α)
+    load_avg_fixed =
+        (load_avg_fixed * LOAD_ALPHA + current_load * (256 - LOAD_ALPHA)) >> 8;
+
+    pr_info("kxo: load_avg (Q8.8) = %u (%.2f)\n", load_avg_fixed,
+            load_avg_fixed / 256.0);
+}
+
 
 static ssize_t kxo_state_show(struct device *dev,
                               struct device_attribute *attr,
@@ -78,7 +101,8 @@ static int major;
 static struct class *kxo_class;
 static struct cdev kxo_cdev;
 
-static char draw_buffer[DRAWBUFFER_SIZE];
+#define DRAW_BUFFER_SIZE 8
+static u8 draw_buffer[DRAW_BUFFER_SIZE];
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -95,7 +119,7 @@ static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 /* Insert the whole chess board into the kfifo buffer */
 static void produce_board(void)
 {
-    unsigned int len = kfifo_in(&rx_fifo, draw_buffer, sizeof(draw_buffer));
+    unsigned int len = kfifo_in(&rx_fifo, draw_buffer, 8);
     if (unlikely(len < sizeof(draw_buffer)) && printk_ratelimit())
         pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(draw_buffer) - len);
 
@@ -120,27 +144,28 @@ static char table[N_GRIDS];
 /* Draw the board into draw_buffer */
 static int draw_board(char *table)
 {
-    int i = 0, k = 0;
-    draw_buffer[i++] = '\n';
-    smp_wmb();
-    draw_buffer[i++] = '\n';
-    smp_wmb();
+    memset(draw_buffer, 0, sizeof(draw_buffer));  // 清空 4 bytes
 
-    while (i < DRAWBUFFER_SIZE) {
-        for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
-            draw_buffer[i++] = j & 1 ? '|' : table[k++];
-            smp_wmb();
+    for (int i = 0; i < 16; ++i) {
+        uint8_t val;
+        switch (table[i]) {
+        case 'O':
+            val = 1;
+            break;  // 01
+        case 'X':
+            val = 2;
+            break;  // 10
+        default:
+            val = 0;
+            break;  // 00
         }
-        draw_buffer[i++] = '\n';
-        smp_wmb();
-        for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
-            draw_buffer[i++] = '-';
-            smp_wmb();
-        }
-        draw_buffer[i++] = '\n';
+        int byte_index = (i * 2) / 8;
+        int bit_offset = (i * 2) % 8;
+        draw_buffer[byte_index] |= (val & 0x3) << bit_offset;
         smp_wmb();
     }
 
+    *(u32 *) (draw_buffer + 4) = coroutine_exec_time_ms;  // 假設 ms 不超過 u32
 
     return 0;
 }
@@ -152,111 +177,104 @@ static void fast_buf_clear(void)
 }
 
 /* Workqueue handler: executed by a kernel thread */
-static void drawboard_work_func(struct work_struct *w)
-{
-    int cpu;
+// static void drawboard_work_func(struct work_struct *w)
+// {
+//     int cpu;
 
-    /* This code runs from a kernel thread, so softirqs and hard-irqs must
-     * be enabled.
-     */
-    WARN_ON_ONCE(in_softirq());
-    WARN_ON_ONCE(in_interrupt());
+//     /* This code runs from a kernel thread, so softirqs and hard-irqs must
+//      * be enabled.
+//      */
+//     WARN_ON_ONCE(in_softirq());
+//     WARN_ON_ONCE(in_interrupt());
 
-    /* Pretend to simulate access to per-CPU data, disabling preemption
-     * during the pr_info().
-     */
-    cpu = get_cpu();
-    pr_info("kxo: [CPU#%d] %s\n", cpu, __func__);
-    put_cpu();
+//     /* Pretend to simulate access to per-CPU data, disabling preemption
+//      * during the pr_info().
+//      */
+//     cpu = get_cpu();
+//     pr_info("kxo: [CPU#%d] %s\n", cpu, __func__);
+//     put_cpu();
 
-    read_lock(&attr_obj.lock);
-    if (attr_obj.display == '0') {
-        read_unlock(&attr_obj.lock);
-        return;
-    }
-    read_unlock(&attr_obj.lock);
+//     read_lock(&attr_obj.lock);
+//     if (attr_obj.display == '0') {
+//         read_unlock(&attr_obj.lock);
+//         return;
+//     }
+//     read_unlock(&attr_obj.lock);
 
-    mutex_lock(&producer_lock);
-    draw_board(table);
-    mutex_unlock(&producer_lock);
+//     mutex_lock(&producer_lock);
+//     draw_board(table);
+//     mutex_unlock(&producer_lock);
 
-    /* Store data to the kfifo buffer */
-    mutex_lock(&consumer_lock);
-    produce_board();
-    mutex_unlock(&consumer_lock);
+//     /* Store data to the kfifo buffer */
+//     mutex_lock(&consumer_lock);
+//     produce_board();
+//     mutex_unlock(&consumer_lock);
 
-    wake_up_interruptible(&rx_wait);
-}
+//     wake_up_interruptible(&rx_wait);
+// }
 
 static char turn;
 static int finish;
 
-static void ai_one_work_func(struct work_struct *w)
+static void ai_one_coro(struct kxo_coroutine *coro)
 {
-    ktime_t tv_start, tv_end;
-    s64 nsecs;
+    CORO_BEGIN(coro);
+    coro->start = ktime_get();
 
-    int cpu;
-
-    WARN_ON_ONCE(in_softirq());
-    WARN_ON_ONCE(in_interrupt());
-
-    cpu = get_cpu();
-    pr_info("kxo: [CPU#%d] start doing %s\n", cpu, __func__);
-    tv_start = ktime_get();
-    mutex_lock(&producer_lock);
-    int move;
-    WRITE_ONCE(move, mcts(table, 'O'));
-
-    smp_mb();
-
+    int move = mcts(table, 'O');
     if (move != -1)
-        WRITE_ONCE(table[move], 'O');
+        table[move] = 'O';
 
-    WRITE_ONCE(turn, 'X');
-    WRITE_ONCE(finish, 1);
-    smp_wmb();
-    mutex_unlock(&producer_lock);
-    tv_end = ktime_get();
+    turn = 'X';
+    finish = 1;
 
-    nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-    pr_info("kxo: [CPU#%d] %s completed in %llu usec\n", cpu, __func__,
-            (unsigned long long) nsecs >> 10);
-    put_cpu();
+    coro->end = ktime_get();
+    coroutine_exec_time_ms = ktime_to_ms(ktime_sub(coro->end, coro->start));
+    pr_info("kxo: ai_one took %u ms\n", coroutine_exec_time_ms);
+
+    CORO_END(coro);
 }
 
-static void ai_two_work_func(struct work_struct *w)
+
+static void ai_two_coro(struct kxo_coroutine *coro)
 {
-    ktime_t tv_start, tv_end;
-    s64 nsecs;
+    CORO_BEGIN(coro);
+    coro->start = ktime_get();
 
-    int cpu;
+    move_t result = negamax_predict(table, 'X');
+    if (result.move != -1) {
+        table[result.move] = 'X';
+    }
 
-    WARN_ON_ONCE(in_softirq());
-    WARN_ON_ONCE(in_interrupt());
+    turn = 'O';
+    finish = 1;
 
-    cpu = get_cpu();
-    pr_info("kxo: [CPU#%d] start doing %s\n", cpu, __func__);
-    tv_start = ktime_get();
-    mutex_lock(&producer_lock);
-    int move;
-    WRITE_ONCE(move, negamax_predict(table, 'X').move);
+    coro->end = ktime_get();
+    coroutine_exec_time_ms = ktime_to_ms(ktime_sub(coro->end, coro->start));
+    pr_info("kxo: ai_two took %u ms\n", coroutine_exec_time_ms);
 
-    smp_mb();
+    CORO_END(coro);
+}
 
-    if (move != -1)
-        WRITE_ONCE(table[move], 'X');
-
-    WRITE_ONCE(turn, 'O');
-    WRITE_ONCE(finish, 1);
-    smp_wmb();
-    mutex_unlock(&producer_lock);
-    tv_end = ktime_get();
-
-    nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-    pr_info("kxo: [CPU#%d] %s completed in %llu usec\n", cpu, __func__,
-            (unsigned long long) nsecs >> 10);
-    put_cpu();
+static void kxo_coroutine_scheduler(void)
+{
+    pr_info("kxo: scheduler turn=%c, finish=%d\n", turn, finish);
+    pr_info("kxo: board after move: %.16s\n", table);
+    if (!finish)
+        return;
+    finish = 0;
+    if (turn == 'O') {
+        ai_one_coro(&ai1_coro);
+        coroutine_exec_time_ms =
+            ktime_to_ms(ktime_sub(ai1_coro.end, ai1_coro.start));
+    } else {
+        ai_two_coro(&ai2_coro);
+        coroutine_exec_time_ms =
+            ktime_to_ms(ktime_sub(ai2_coro.end, ai2_coro.start));
+    }
+    draw_board(table);
+    produce_board();
+    wake_up_interruptible(&rx_wait);
 }
 
 /* Workqueue for asynchronous bottom-half processing */
@@ -265,9 +283,9 @@ static struct workqueue_struct *kxo_workqueue;
 /* Work item: holds a pointer to the function that is going to be executed
  * asynchronously.
  */
-static DECLARE_WORK(drawboard_work, drawboard_work_func);
-static DECLARE_WORK(ai_one_work, ai_one_work_func);
-static DECLARE_WORK(ai_two_work, ai_two_work_func);
+// static DECLARE_WORK(drawboard_work, drawboard_work_func);
+// static DECLARE_WORK(ai_one_work, ai_one_work_func);
+// static DECLARE_WORK(ai_two_work, ai_two_work_func);
 
 /* Tasklet handler.
  *
@@ -275,56 +293,65 @@ static DECLARE_WORK(ai_two_work, ai_two_work_func);
  * two of the same type of tasklet cannot run simultaneously. Moreover, a
  * tasklet always runs on the same CPU that schedules it.
  */
-static void game_tasklet_func(unsigned long __data)
-{
-    ktime_t tv_start, tv_end;
-    s64 nsecs;
+// static void game_tasklet_func(unsigned long __data)
+// {
+//     ktime_t tv_start, tv_end;
+//     s64 nsecs;
 
-    WARN_ON_ONCE(!in_interrupt());
-    WARN_ON_ONCE(!in_softirq());
+//     WARN_ON_ONCE(!in_interrupt());
+//     WARN_ON_ONCE(!in_softirq());
 
-    tv_start = ktime_get();
+//     tv_start = ktime_get();
 
-    READ_ONCE(finish);
-    READ_ONCE(turn);
-    smp_rmb();
+//     READ_ONCE(finish);
+//     READ_ONCE(turn);
+//     smp_rmb();
 
-    if (finish && turn == 'O') {
-        WRITE_ONCE(finish, 0);
-        smp_wmb();
-        queue_work(kxo_workqueue, &ai_one_work);
-    } else if (finish && turn == 'X') {
-        WRITE_ONCE(finish, 0);
-        smp_wmb();
-        queue_work(kxo_workqueue, &ai_two_work);
-    }
-    queue_work(kxo_workqueue, &drawboard_work);
-    tv_end = ktime_get();
+//     if (finish && turn == 'O') {
+//         WRITE_ONCE(finish, 0);
+//         smp_wmb();
+//         queue_work(kxo_workqueue, &ai_one_work);
+//     } else if (finish && turn == 'X') {
+//         WRITE_ONCE(finish, 0);
+//         smp_wmb();
+//         queue_work(kxo_workqueue, &ai_two_work);
+//     }
+//     queue_work(kxo_workqueue, &drawboard_work);
+//     tv_end = ktime_get();
 
-    nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
+//     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
 
-    pr_info("kxo: [CPU#%d] %s in_softirq: %llu usec\n", smp_processor_id(),
-            __func__, (unsigned long long) nsecs >> 10);
-}
+//     pr_info("kxo: [CPU#%d] %s in_softirq: %llu usec\n", smp_processor_id(),
+//             __func__, (unsigned long long) nsecs >> 10);
+// }
 
 /* Tasklet for asynchronous bottom-half processing in softirq context */
-static DECLARE_TASKLET_OLD(game_tasklet, game_tasklet_func);
+// static DECLARE_TASKLET_OLD(game_tasklet, game_tasklet_func);
 
-static void ai_game(void)
+// static void ai_game(void)
+// {
+//     WARN_ON_ONCE(!irqs_disabled());
+
+//     pr_info("kxo: [CPU#%d] doing AI game\n", smp_processor_id());
+//     pr_info("kxo: [CPU#%d] scheduling tasklet\n", smp_processor_id());
+//     tasklet_schedule(&game_tasklet);
+// }
+void some_func(void)
 {
-    WARN_ON_ONCE(!irqs_disabled());
+    float f = 3.14;
+    float result = f * 2.0;             // 6.28
+    int r1000 = (int) (result * 1000);  // 6280
 
-    pr_info("kxo: [CPU#%d] doing AI game\n", smp_processor_id());
-    pr_info("kxo: [CPU#%d] scheduling tasklet\n", smp_processor_id());
-    tasklet_schedule(&game_tasklet);
+    pr_info("kxo: result = %d.%03d\n", r1000 / 1000, r1000 % 1000);
 }
 
 static void timer_handler(struct timer_list *__timer)
 {
     ktime_t tv_start, tv_end;
     s64 nsecs;
-
-    pr_info("kxo: [CPU#%d] enter %s\n", smp_processor_id(), __func__);
+    some_func();
+    // pr_info("kxo: checking win... current board: %.16s\n", table);
+    // pr_info("kxo: [CPU#%d] enter %s\n", smp_processor_id(), __func__);
     /* We are using a kernel timer to simulate a hard-irq, so we must expect
      * to be in softirq context here.
      */
@@ -338,7 +365,7 @@ static void timer_handler(struct timer_list *__timer)
     char win = check_win(table);
 
     if (win == ' ') {
-        ai_game();
+        kxo_coroutine_scheduler();
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
     } else {
         read_lock(&attr_obj.lock);
@@ -449,6 +476,8 @@ static const struct file_operations kxo_fops = {
 
 static int __init kxo_init(void)
 {
+    some_func();
+
     dev_t dev_id;
     int ret;
 
@@ -541,7 +570,7 @@ static void __exit kxo_exit(void)
     dev_t dev_id = MKDEV(major, 0);
 
     del_timer_sync(&timer);
-    tasklet_kill(&game_tasklet);
+    // tasklet_kill(&game_tasklet);
     flush_workqueue(kxo_workqueue);
     destroy_workqueue(kxo_workqueue);
     vfree(fast_buf.buf);

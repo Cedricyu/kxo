@@ -13,10 +13,10 @@ static struct hlist_head *hash_table;
 static inline u64 wyhash64_stateless(u64 *seed)
 {
     *seed += 0x60bee2bee120fc15;
-    u128 tmp;
-    tmp = (u128) *seed * 0xa3b195354a39b70d;
+    __uint128_t tmp;
+    tmp = (__uint128_t) *seed * 0xa3b195354a39b70d;
     u64 m1 = (tmp >> 64) ^ tmp;
-    tmp = (u128) m1 * 0x1b03738712fad5c9;
+    tmp = (__uint128_t) m1 * 0x1b03738712fad5c9;
     u64 m2 = (tmp >> 64) ^ tmp;
     return m2;
 }
@@ -53,7 +53,7 @@ zobrist_entry_t *zobrist_get(u64 key)
 
     zobrist_entry_t *entry = NULL;
 
-    hlist_for_each_entry(entry, &hash_table[hash_key], ht_list) {
+    hlist_for_each_entry (entry, &hash_table[hash_key], ht_list) {
         if (entry->key == key)
             return entry;
     }
