@@ -1,5 +1,4 @@
 #include <fcntl.h>
-#include <getopt.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,13 +7,85 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include "game.h"
-
 #define XO_STATUS_FILE "/sys/module/kxo/initstate"
 #define XO_DEVICE_FILE "/dev/kxo"
 #define XO_DEVICE_ATTR_FILE "/sys/class/kxo/kxo/kxo_state"
 
-#define READBUFFER_SIZE 8
+#define READBUFFER_SIZE 12
+#define BOARD_SIZE 16
+
+// ====== Coroutine 宏與結構 ======
+struct cr {
+    int state;
+    bool finished;
+};
+#define cr_begin(cr)       \
+    switch ((cr)->state) { \
+    case 0:
+#define cr_end(cr) }
+#define cr_yield(cr)            \
+    do {                        \
+        (cr)->state = __LINE__; \
+        return;                 \
+    case __LINE__:;             \
+    } while (0)
+#define cr_exit(cr)            \
+    do {                       \
+        (cr)->finished = true; \
+        return;                \
+    } while (0)
+
+
+char move_sequence[128] = "";
+void add_move_to_sequence(char col, int row)
+{
+    char move[8];
+    snprintf(move, sizeof(move), "%c%d", col, row);
+    if (strlen(move_sequence) > 0)
+        strcat(move_sequence, " -> ");
+    strcat(move_sequence, move);
+}
+
+unsigned char prev_bitmap[READBUFFER_SIZE] = {0};
+
+static inline bool is_first_move(const unsigned char *curr_bitmap)
+{
+    int non_zero_cells = 0;
+    for (int i = 0; i < BOARD_SIZE; ++i) {
+        int byte_index = (i * 2) / 8;
+        int bit_offset = (i * 2) % 8;
+        u_int8_t val = (curr_bitmap[byte_index] >> bit_offset) & 0x3;
+        if (val != 0)
+            non_zero_cells++;
+    }
+    return non_zero_cells == 1;
+}
+
+static int game_cnt = 0;
+void detect_move(unsigned char *curr_bitmap)
+{
+    for (int i = 0; i < BOARD_SIZE; ++i) {
+        int byte_index = (i * 2) / 8;
+        int bit_offset = (i * 2) % 8;
+        u_int8_t prev_val = (prev_bitmap[byte_index] >> bit_offset) & 0x3;
+        u_int8_t curr_val = (curr_bitmap[byte_index] >> bit_offset) & 0x3;
+
+        if (is_first_move(curr_bitmap)) {
+            add_move_to_sequence('G', game_cnt++);
+            return;
+        }
+        if (prev_val != curr_val) {
+            // 偵測到第 i 個格子的狀態改變
+            char cols[] = "ABCD";
+            int row = i / 4;
+            int col = i % 4;
+            add_move_to_sequence(cols[col], row + 1);
+            printf("Detected move: %c%d\n", cols[col], row + 1);
+            break;  // 假設每次只有一個移動
+        }
+    }
+    memcpy(prev_bitmap, curr_bitmap, READBUFFER_SIZE);
+}
 
 void draw_board_user(unsigned char *bitmap)
 {
@@ -37,6 +108,7 @@ void draw_board_user(unsigned char *bitmap)
     }
 }
 
+// ====== 狀態檢查 ======
 static bool status_check(void)
 {
     FILE *fp = fopen(XO_STATUS_FILE, "r");
@@ -57,6 +129,7 @@ static bool status_check(void)
     return true;
 }
 
+// ====== Raw mode 處理 ======
 static struct termios orig_termios;
 
 static void raw_mode_disable(void)
@@ -74,8 +147,10 @@ static void raw_mode_enable(void)
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
+// ====== 全域旗標 ======
 static bool read_attr, end_attr;
 
+// ====== 鍵盤處理邏輯 ======
 static void listen_keyboard_handler(void)
 {
     int attr_fd = open(XO_DEVICE_ATTR_FILE, O_RDWR);
@@ -99,12 +174,76 @@ static void listen_keyboard_handler(void)
             end_attr = true;
             write(attr_fd, buf, 6);
             printf("Stopping the kernel space tic-tac-toe game...\n");
+            printf("Moves: %s\n", move_sequence);
             break;
         }
     }
     close(attr_fd);
 }
 
+// ====== keyboard_loop coroutine ======
+void keyboard_loop(struct cr *cr)
+{
+    cr_begin(cr);
+    while (!cr->finished) {
+        // 等待 stdin 可讀
+        while (true) {
+            fd_set set;
+            FD_ZERO(&set);
+            FD_SET(STDIN_FILENO, &set);
+            struct timeval tv = {0, 0};  // 非阻塞
+            int ret = select(STDIN_FILENO + 1, &set, NULL, NULL, &tv);
+            if (ret > 0 && FD_ISSET(STDIN_FILENO, &set))
+                break;
+            cr_yield(cr);
+        }
+        listen_keyboard_handler();
+        if (end_attr)
+            cr_exit(cr);
+        cr_yield(cr);
+    }
+    cr_end(cr);
+}
+
+// ====== display_loop coroutine ======
+void display_loop(struct cr *cr, int device_fd, char *display_buf)
+{
+    cr_begin(cr);
+    while (!cr->finished) {
+        // 等待 device_fd 可讀，且 read_attr 為 true
+        while (true) {
+            if (!read_attr) {
+                cr_yield(cr);
+                continue;
+            }
+            fd_set set;
+            FD_ZERO(&set);
+            FD_SET(device_fd, &set);
+            struct timeval tv = {0, 0};  // 非阻塞
+            int ret = select(device_fd + 1, &set, NULL, NULL, &tv);
+            if (ret > 0 && FD_ISSET(device_fd, &set))
+                break;
+            cr_yield(cr);
+        }
+        printf("\033[H\033[J");  // 清螢幕
+        ssize_t n = read(device_fd, display_buf, READBUFFER_SIZE);
+        if (n <= 0) {
+            cr_yield(cr);
+            continue;
+        }
+        unsigned char *bitmap = display_buf;
+        u_int32_t ai1_ms = ((u_int32_t *) display_buf)[1];
+        u_int32_t ai2_ms = ((u_int32_t *) display_buf)[2];
+        printf("AI1 Avg Time: %u ms\n", ai1_ms);
+        printf("AI2 Avg Time: %u ms\n", ai2_ms);
+        detect_move(display_buf);
+        draw_board_user(display_buf);
+        cr_yield(cr);
+    }
+    cr_end(cr);
+}
+
+// ====== main & scheduler ======
 int main(int argc, char *argv[])
 {
     if (!status_check())
@@ -115,44 +254,19 @@ int main(int argc, char *argv[])
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
     char display_buf[READBUFFER_SIZE];
-
-    fd_set readset;
     int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
-    int max_fd = device_fd > STDIN_FILENO ? device_fd : STDIN_FILENO;
+
     read_attr = true;
     end_attr = false;
 
+    struct cr keyboard_cr = {0, false};
+    struct cr display_cr = {0, false};
+
+    // coroutine scheduler
     while (!end_attr) {
-        FD_ZERO(&readset);
-        FD_SET(STDIN_FILENO, &readset);
-        FD_SET(device_fd, &readset);
-
-        int result = select(max_fd + 1, &readset, NULL, NULL, NULL);
-        if (result < 0) {
-            printf("Error with select system call\n");
-            exit(1);
-        }
-
-        if (FD_ISSET(STDIN_FILENO, &readset)) {
-            FD_CLR(STDIN_FILENO, &readset);
-            listen_keyboard_handler();
-        } else if (read_attr && FD_ISSET(device_fd, &readset)) {
-            FD_CLR(device_fd, &readset);
-            printf("\033[H\033[J");  // ASCII escape code to clear the screen
-            // read(device_fd, display_buf, READBUFFER_SIZE); printf("%s",
-            // display_buf);
-            ssize_t n = read(device_fd, display_buf, sizeof(display_buf));
-            // // printf("Read display_buf  fer size: %zd\n", n);
-            // if (n < 4) {
-            //     usleep(1000);  // 避免 busy looping
-            //     continue;
-            // }
-            unsigned char *bitmap = display_buf;
-
-            u_int32_t exec_time_ms = *(u_int32_t *) (display_buf + 4);
-            printf("AI move took %u ms\n", exec_time_ms);
-            draw_board_user(display_buf);
-        }
+        keyboard_loop(&keyboard_cr);
+        display_loop(&display_cr, device_fd, display_buf);
+        usleep(1000);  // 輕量 sleep，避免忙等
     }
 
     raw_mode_disable();
